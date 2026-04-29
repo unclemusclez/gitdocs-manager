@@ -42,17 +42,18 @@ class GitDocsManager:
                 "sparse_patterns": [
                     "/*",
                     "!/*",
-                    "docs",
-                    "*Docs",
-                    "*examples",
-                    "*templates",
-                    "*/docs",
-                    "*/Docs",
-                    "*/examples",
-                    "*/templates",
+                    "docs/",
+                    "*Docs/",
+                    "*examples/",
+                    "*templates/",
+                    "*/docs/",
+                    "*/Docs/",
+                    "*/examples/",
+                    "*/templates/",
                     "/*.md*",
                     "/*.txt",
                     "/*.rst",
+                    "/*.lst"
                 ],
             }
             self._write_json(self.config_path, default_config)
@@ -231,6 +232,18 @@ class GitDocsManager:
                 merged.append(p)
         return merged
 
+    def _show_sparse_diff(self, repo_name, before, after):
+        removed = [p for p in before if p not in after]
+        added = [p for p in after if p not in before]
+        if not removed and not added:
+            return False
+        print(f"  Sparse-checkout changes for {repo_name}:")
+        for p in removed:
+            print(f"    - {p}")
+        for p in added:
+            print(f"    + {p}")
+        return True
+
     def _apply_sparse_checkout(self, repo_path, patterns=None, merge=True):
         incoming = patterns or self.sparse_patterns
         if not incoming:
@@ -240,10 +253,7 @@ class GitDocsManager:
         effective_patterns = self._merge_sparse_patterns(existing, incoming) if merge else incoming
 
         if existing and merge:
-            added = [p for p in incoming if p not in existing]
-            if added:
-                print(f"  Merging {len(added)} new pattern(s) into existing sparse-checkout")
-            else:
+            if not self._show_sparse_diff(repo_path.name, existing, effective_patterns):
                 print(f"  Sparse-checkout already up to date")
                 return
 
@@ -258,6 +268,29 @@ class GitDocsManager:
         if info_dir.exists() or (git_dir and info_dir.parent == git_dir):
             info_dir.mkdir(parents=True, exist_ok=True)
         sparse_file.write_text("\n".join(effective_patterns) + "\n")
+
+    def desparse(self, names):
+        submodules = self._detect_submodules()
+        found = {Path(rp).name: info for rp, info in submodules.items()}
+        done = 0
+        for name in names:
+            info = found.get(name)
+            if not info:
+                print(f"Not found: {name}")
+                continue
+            repo_path = info["abs_path"]
+            if not repo_path.exists():
+                print(f"Skipping {name} (not checked out)")
+                continue
+            before = self._read_existing_sparse_patterns(repo_path)
+            self._run_git(["sparse-checkout", "disable"], cwd=repo_path)
+            after = self._read_existing_sparse_patterns(repo_path)
+            if before:
+                self._show_sparse_diff(name, before, after)
+            print(f"  Disabled sparse-checkout for {name}")
+            done += 1
+        if done:
+            print(f"Desparsed {done} repo(s)")
 
     def _register_untracked(self, submodules):
         registered = 0
@@ -404,6 +437,9 @@ def main():
     remove_parser = sub.add_parser("remove", help="Remove a submodule")
     remove_parser.add_argument("name", help="Repository name to remove")
 
+    desparse_parser = sub.add_parser("desparse", help="Disable sparse-checkout for specific repos")
+    desparse_parser.add_argument("names", nargs="+", help="Repository name(s) to desparse")
+
     sub.add_parser("status", help="Show status of all managed submodules")
 
     sub.add_parser("index", help="Regenerate the directory index")
@@ -423,6 +459,8 @@ def main():
         gdm.add(args.url, sparse=args.sparse, depth=args.depth, merge=not args.no_merge)
     elif args.command == "remove":
         gdm.remove(args.name)
+    elif args.command == "desparse":
+        gdm.desparse(args.names)
     elif args.command == "status":
         gdm.status()
     elif args.command == "index":
