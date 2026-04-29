@@ -12,12 +12,10 @@ class GitDocsManager:
     BLACKLIST_FILE = "blacklist.txt"
     WHITELIST_FILE = "whitelist.txt"
     INDEX_FILE = "index.json"
-    SUBMODULES_DIR = "repos"
 
     def __init__(self, root=None):
         self.root = Path(root or Path.cwd()).resolve()
         self.gdm_dir = self.root / self.GDM_DIR
-        self.submodules_dir = self.gdm_dir / self.SUBMODULES_DIR
         self.config_path = self.gdm_dir / self.CONFIG_FILE
 
         self._init_gdm()
@@ -37,8 +35,6 @@ class GitDocsManager:
     def _init_gdm(self):
         if not self.gdm_dir.exists():
             self.gdm_dir.mkdir(parents=True)
-        if not self.submodules_dir.exists():
-            self.submodules_dir.mkdir(parents=True)
 
         if not self.config_path.exists():
             default_config = {
@@ -50,24 +46,16 @@ class GitDocsManager:
                     "/Docs",
                     "/examples",
                     "/templates",
-                    "/*.md*",
+                    "/*.md",
                     "/*.txt",
-                    "/*.rst",
                 ],
             }
             self._write_json(self.config_path, default_config)
 
-        repos_file = self.gdm_dir / self.REPOS_FILE
-        if not repos_file.exists():
-            repos_file.touch()
-
-        blacklist_file = self.gdm_dir / self.BLACKLIST_FILE
-        if not blacklist_file.exists():
-            blacklist_file.touch()
-
-        whitelist_file = self.gdm_dir / self.WHITELIST_FILE
-        if not whitelist_file.exists():
-            whitelist_file.touch()
+        for fname in [self.REPOS_FILE, self.BLACKLIST_FILE, self.WHITELIST_FILE]:
+            p = self.gdm_dir / fname
+            if not p.exists():
+                p.touch()
 
         sparse_file = self.gdm_dir / self.SPARSE_FILE
         if not sparse_file.exists():
@@ -101,6 +89,10 @@ class GitDocsManager:
         with open(path, "a") as f:
             f.write(f"{line}\n")
 
+    def _write_file(self, path, content):
+        with open(path, "w") as f:
+            f.write(content)
+
     def is_allowed(self, url_or_name):
         if any(item in url_or_name for item in self.blacklist):
             return False
@@ -111,39 +103,36 @@ class GitDocsManager:
     def _repo_name_from_url(self, url):
         return url.rstrip("/").split("/")[-1].replace(".git", "")
 
-    def _detect_existing_submodules(self):
-        discovered = {}
-        if not self.submodules_dir.exists():
-            return discovered
-
-        for item in self.submodules_dir.iterdir():
-            git_marker = item / ".git"
-            if not item.is_dir():
-                continue
-            if not git_marker.exists() and not git_marker.is_file():
-                continue
-
-            res = self._run_git(["remote", "get-url", "origin"], cwd=item)
-            if res.returncode == 0:
-                remote_url = res.stdout.strip()
-                discovered[item.name] = remote_url
-            else:
-                discovered[item.name] = None
-
-        return discovered
-
-    def _get_tracked_submodules(self):
-        res = self._run_git(["submodule", "status", "--recursive"], cwd=self.submodules_dir)
-        tracked = {}
+    def _detect_submodules(self):
+        submodules = {}
+        res = self._run_git(["submodule", "status", "--recursive"])
         if res.returncode != 0:
-            return tracked
+            return submodules
         for line in res.stdout.strip().splitlines():
+            if not line.strip():
+                continue
             parts = line.strip().split()
-            if len(parts) >= 2:
-                sha = parts[0].lstrip("+-")
-                path = parts[1]
-                tracked[path] = {"sha": sha, "modified": parts[0].startswith("+"), "outdated": parts[0].startswith("-")}
-        return tracked
+            if len(parts) < 2:
+                continue
+            prefix = parts[0]
+            sha = prefix.lstrip("+-")
+            rel_path = parts[1]
+            abs_path = self.root / rel_path
+
+            remote_url = None
+            if abs_path.exists():
+                r = self._run_git(["remote", "get-url", "origin"], cwd=abs_path)
+                if r.returncode == 0:
+                    remote_url = r.stdout.strip()
+
+            submodules[rel_path] = {
+                "sha": sha,
+                "modified": prefix.startswith("+"),
+                "outdated": prefix.startswith("-"),
+                "remote_url": remote_url,
+                "abs_path": abs_path,
+            }
+        return submodules
 
     def add(self, url, sparse=None, depth=None):
         if not self.is_allowed(url):
@@ -151,26 +140,24 @@ class GitDocsManager:
             return
 
         name = self._repo_name_from_url(url)
-        repo_path = self.submodules_dir / name
+        submodules = self._detect_submodules()
 
-        if repo_path.exists():
-            print(f"Already exists: {name}. Use 'sync' to update.")
-            return
+        for rel_path, info in submodules.items():
+            if info["remote_url"] == url or Path(rel_path).name == name:
+                print(f"Already exists at {rel_path}. Use 'sync' to update.")
+                return
 
         effective_depth = depth or self.shallow_depth
 
         print(f"Adding {name} (depth={effective_depth})")
         res = self._run_git(
-            ["submodule", "add", "--depth", str(effective_depth), url, f"./{self.SUBMODULES_DIR}/{name}"],
-            cwd=self.root,
+            ["submodule", "add", "--depth", str(effective_depth), url, name],
         )
         if res.returncode != 0:
-            print(f"submodule add failed, falling back to clone: {res.stderr.strip()}")
-            self._run_git(
-                ["clone", "--no-checkout", "--depth", str(effective_depth), url, str(repo_path)]
-            )
-            self._run_git(["init"], cwd=repo_path, check=True)
+            print(f"submodule add failed: {res.stderr.strip()}")
+            return
 
+        repo_path = self.root / name
         self._apply_sparse_checkout(repo_path, sparse)
         self._run_git(["checkout", "HEAD"], cwd=repo_path)
 
@@ -181,20 +168,25 @@ class GitDocsManager:
         print(f"Added: {name}")
 
     def remove(self, name):
-        repo_path = self.submodules_dir / name
-        if not repo_path.exists():
+        submodules = self._detect_submodules()
+        match_path = None
+        for rel_path, info in submodules.items():
+            if Path(rel_path).name == name:
+                match_path = rel_path
+                break
+
+        if not match_path:
             print(f"Not found: {name}")
             return
 
-        res = self._run_git(
-            ["submodule", "deinit", "-f", f"./{self.SUBMODULES_DIR}/{name}"],
-            cwd=self.root,
-        )
-        self._run_git(["rm", "-rf", str(repo_path)], cwd=self.root)
+        abs_path = self.root / match_path
 
-        if res.returncode != 0:
+        self._run_git(["submodule", "deinit", "-f", match_path])
+        self._run_git(["rm", "-rf", match_path])
+
+        if abs_path.exists():
             import shutil
-            shutil.rmtree(repo_path, ignore_errors=True)
+            shutil.rmtree(abs_path, ignore_errors=True)
 
         self.target_repos = [u for u in self.target_repos if self._repo_name_from_url(u) != name]
         self._write_file(self.gdm_dir / self.REPOS_FILE, "\n".join(self.target_repos) + "\n" if self.target_repos else "")
@@ -210,111 +202,133 @@ class GitDocsManager:
         self._run_git(["sparse-checkout", "set"] + effective_patterns, cwd=repo_path)
 
         sparse_file = repo_path / ".git" / "info" / "sparse-checkout"
-        git_modules = repo_path / ".git"
-        if git_modules.is_file():
-            git_dir = Path(git_modules.read_text().strip().split(":")[-1].strip())
+        git_ref = repo_path / ".git"
+        if git_ref.is_file():
+            git_dir = Path(git_ref.read_text().strip().split(":")[-1].strip())
             sparse_file = git_dir / "info" / "sparse-checkout"
 
         if not sparse_file.parent.exists():
             sparse_file.parent.mkdir(parents=True, exist_ok=True)
         sparse_file.write_text("\n".join(effective_patterns) + "\n")
 
-    def sync(self):
-        existing = self._detect_existing_submodules()
-        tracked = self._get_tracked_submodules()
+    def _register_untracked(self, submodules):
+        registered = 0
+        for rel_path, info in submodules.items():
+            name = Path(rel_path).name
+            remote_url = info.get("remote_url")
+            if not self.is_allowed(name) and not self.is_allowed(remote_url or ""):
+                continue
+            if remote_url and remote_url not in self.target_repos:
+                print(f"Registering discovered submodule: {rel_path} -> {remote_url}")
+                self._append_file(self.gdm_dir / self.REPOS_FILE, remote_url)
+                self.target_repos.append(remote_url)
+                registered += 1
+        return registered
 
-        print(f"Detected {len(existing)} existing submodules, {len(tracked)} tracked by git")
+    def sync(self):
+        submodules = self._detect_submodules()
+        print(f"Detected {len(submodules)} submodules")
+
+        self._register_untracked(submodules)
 
         for url in self.target_repos:
             name = self._repo_name_from_url(url)
-
             if not self.is_allowed(url) and not self.is_allowed(name):
                 print(f"Skipping {name} (not allowed)")
                 continue
 
-            repo_path = self.submodules_dir / name
+            match = None
+            for rel_path, info in submodules.items():
+                if info.get("remote_url") == url or Path(rel_path).name == name:
+                    match = (rel_path, info)
+                    break
 
-            if not repo_path.exists():
-                print(f"Cloning: {name}")
-                effective_depth = self.shallow_depth
-                self._run_git(
-                    ["clone", "--no-checkout", "--depth", str(effective_depth), url, str(repo_path)]
-                )
-            else:
-                print(f"Updating: {name}")
-                if name in tracked:
-                    self._run_git(["submodule", "update", "--remote", f"./{self.SUBMODULES_DIR}/{name}"], cwd=self.root)
+            if match:
+                rel_path, info = match
+                repo_path = info["abs_path"]
+                if not repo_path.exists():
+                    print(f"Initializing: {rel_path}")
+                    self._run_git(["submodule", "update", "--init", rel_path])
                 else:
-                    self._run_git(["pull", "--depth", str(self.shallow_depth)], cwd=repo_path)
-
-            self._apply_sparse_checkout(repo_path)
-            self._run_git(["checkout", "HEAD"], cwd=repo_path)
-
-        for name, remote_url in existing.items():
-            if not self.is_allowed(name):
-                continue
-            if remote_url and remote_url not in self.target_repos:
-                print(f"Registering discovered submodule: {name} -> {remote_url}")
-                self._append_file(self.gdm_dir / self.REPOS_FILE, remote_url)
-                self.target_repos.append(remote_url)
+                    print(f"Updating: {rel_path}")
+                    self._run_git(["submodule", "update", "--remote", rel_path])
+                self._apply_sparse_checkout(repo_path)
+                self._run_git(["checkout", "HEAD"], cwd=repo_path)
+            else:
+                print(f"Adding: {name}")
+                self._run_git(
+                    ["submodule", "add", "--depth", str(self.shallow_depth), url, name]
+                )
+                repo_path = self.root / name
+                self._apply_sparse_checkout(repo_path)
+                self._run_git(["checkout", "HEAD"], cwd=repo_path)
 
         self.generate_index()
 
     def status(self):
-        existing = self._detect_existing_submodules()
-        tracked = self._get_tracked_submodules()
+        submodules = self._detect_submodules()
 
         print(f"\nGDM Status ({self.root})")
-        print(f"{'='*50}")
-        print(f"Configured repos: {len(self.target_repos)}")
-        print(f"Detected submodules: {len(existing)}")
-        print(f"Git-tracked submodules: {len(tracked)}")
-        print(f"Shallow depth: {self.shallow_depth}")
-        print(f"Sparse patterns: {len(self.sparse_patterns)}")
+        print(f"{'='*60}")
+        print(f"Configured repos:  {len(self.target_repos)}")
+        print(f"Detected submodules: {len(submodules)}")
+        print(f"Shallow depth:     {self.shallow_depth}")
+        print(f"Sparse patterns:   {len(self.sparse_patterns)}")
 
-        if existing:
-            print(f"\n{'Name':<30} {'Remote':<50} {'Status'}")
-            print(f"{'-'*30} {'-'*50} {'-'*20}")
-            for name, remote_url in sorted(existing.items()):
-                status = "tracked" if name in tracked else "untracked"
-                if name in tracked:
-                    info = tracked[name]
-                    if info.get("modified"):
-                        status = "modified"
-                    elif info.get("outdated"):
-                        status = "outdated"
-                print(f"{name:<30} {(remote_url or 'unknown'):<50} {status}")
+        if submodules:
+            print(f"\n{'Path':<35} {'Remote':<45} {'Status'}")
+            print(f"{'-'*35} {'-'*45} {'-'*20}")
+            for rel_path in sorted(submodules):
+                info = submodules[rel_path]
+                if info.get("modified"):
+                    status = "modified"
+                elif info.get("outdated"):
+                    status = "outdated"
+                else:
+                    status = "ok"
+                remote = info.get("remote_url") or "unknown"
+                if not self.is_allowed(Path(rel_path).name):
+                    status = "blocked"
+                elif info.get("remote_url") and info["remote_url"] not in self.target_repos:
+                    status += ", unregistered"
+                print(f"{rel_path:<35} {remote:<45} {status}")
 
-        unregistered = [u for u in self.target_repos if self._repo_name_from_url(u) not in existing]
-        if unregistered:
-            print(f"\nNot yet cloned:")
-            for url in unregistered:
-                print(f"  {self._repo_name_from_url(url)}: {url}")
+        configured_names = set()
+        for url in self.target_repos:
+            configured_names.add(self._repo_name_from_url(url))
+        detected_names = {Path(p).name for p in submodules}
 
-    def _write_file(self, path, content):
-        with open(path, "w") as f:
-            f.write(content)
+        missing = configured_names - detected_names
+        if missing:
+            print(f"\nNot yet added as submodules:")
+            for name in sorted(missing):
+                print(f"  {name}")
 
     def generate_index(self):
+        submodules = self._detect_submodules()
         manifest = {}
-        for repo_dir in self.submodules_dir.iterdir():
-            if not repo_dir.is_dir() or repo_dir.name.startswith("."):
-                continue
-            if not self.is_allowed(repo_dir.name):
+
+        for rel_path, info in submodules.items():
+            name = Path(rel_path).name
+            if not self.is_allowed(name):
                 continue
 
-            git_marker = repo_dir / ".git"
-            if not git_marker.exists() and not git_marker.is_file():
+            repo_path = info["abs_path"]
+            if not repo_path.exists():
                 continue
 
-            manifest[repo_dir.name] = sorted(
-                str(p.relative_to(repo_dir))
-                for p in repo_dir.rglob("*")
+            manifest[name] = sorted(
+                str(p.relative_to(repo_path))
+                for p in repo_path.rglob("*")
                 if p.is_file() and ".git" not in p.parts
             )
 
         index_path = self.gdm_dir / self.INDEX_FILE
-        self._write_json(index_path, {"graph": manifest, "root": str(self.root), "shallow_depth": self.shallow_depth})
+        self._write_json(index_path, {
+            "graph": manifest,
+            "root": str(self.root),
+            "shallow_depth": self.shallow_depth,
+        })
         print(f"\nIndex generated: {index_path} ({len(manifest)} repos)")
 
 
