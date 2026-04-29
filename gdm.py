@@ -198,15 +198,24 @@ class GitDocsManager:
 
         print(f"Removed: {name}")
 
-    def _resolve_sparse_checkout_file(self, repo_path):
-        sparse_file = repo_path / ".git" / "info" / "sparse-checkout"
+    def _resolve_git_dir(self, repo_path):
         git_ref = repo_path / ".git"
         if git_ref.is_file():
-            git_dir = Path(git_ref.read_text().strip().split(":")[-1].strip())
-            candidate = git_dir / "info" / "sparse-checkout"
-            if candidate.exists():
-                sparse_file = candidate
-        return sparse_file
+            text = git_ref.read_text().strip()
+            if text.startswith("gitdir:"):
+                git_dir = Path(text.split(":", 1)[1].strip())
+                if git_dir.is_absolute():
+                    return git_dir
+                return (repo_path / git_dir).resolve()
+        if git_ref.is_dir():
+            return git_ref
+        return None
+
+    def _resolve_sparse_checkout_file(self, repo_path):
+        git_dir = self._resolve_git_dir(repo_path)
+        if git_dir:
+            return git_dir / "info" / "sparse-checkout"
+        return repo_path / ".git" / "info" / "sparse-checkout"
 
     def _read_existing_sparse_patterns(self, repo_path):
         sparse_file = self._resolve_sparse_checkout_file(repo_path)
@@ -242,8 +251,12 @@ class GitDocsManager:
         self._run_git(["sparse-checkout", "set"] + effective_patterns, cwd=repo_path)
 
         sparse_file = self._resolve_sparse_checkout_file(repo_path)
-        if not sparse_file.parent.exists():
-            sparse_file.parent.mkdir(parents=True, exist_ok=True)
+        git_dir = self._resolve_git_dir(repo_path)
+        if git_dir and not git_dir.exists():
+            git_dir.mkdir(parents=True, exist_ok=True)
+        info_dir = sparse_file.parent
+        if info_dir.exists() or (git_dir and info_dir.parent == git_dir):
+            info_dir.mkdir(parents=True, exist_ok=True)
         sparse_file.write_text("\n".join(effective_patterns) + "\n")
 
     def _register_untracked(self, submodules):
