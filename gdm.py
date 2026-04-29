@@ -10,7 +10,6 @@ class GitDocsManager:
     REPOS_FILE = "repos.txt"
     SPARSE_FILE = "sparse-patterns.txt"
     BLACKLIST_FILE = "blacklist.txt"
-    WHITELIST_FILE = "whitelist.txt"
     INDEX_FILE = "index.json"
 
     def __init__(self, root=None):
@@ -56,7 +55,7 @@ class GitDocsManager:
             }
             self._write_json(self.config_path, default_config)
 
-        for fname in [self.REPOS_FILE, self.BLACKLIST_FILE, self.WHITELIST_FILE]:
+        for fname in [self.REPOS_FILE, self.BLACKLIST_FILE]:
             p = self.gdm_dir / fname
             if not p.exists():
                 p.touch()
@@ -72,7 +71,6 @@ class GitDocsManager:
         self.shallow_depth = self.config.get("shallow_depth", 1)
         self.target_repos = self._load_file(self.gdm_dir / self.REPOS_FILE)
         self.blacklist = self._load_file(self.gdm_dir / self.BLACKLIST_FILE)
-        self.whitelist = self._load_file(self.gdm_dir / self.WHITELIST_FILE)
         self.sparse_patterns = self._load_file(self.gdm_dir / self.SPARSE_FILE)
 
     def _read_json(self, path):
@@ -98,11 +96,7 @@ class GitDocsManager:
             f.write(content)
 
     def is_allowed(self, url_or_name):
-        if any(item in url_or_name for item in self.blacklist):
-            return False
-        if self.whitelist:
-            return any(item in url_or_name for item in self.whitelist)
-        return True
+        return not any(item in url_or_name for item in self.blacklist)
 
     def _repo_name_from_url(self, url):
         return url.rstrip("/").split("/")[-1].replace(".git", "")
@@ -140,7 +134,7 @@ class GitDocsManager:
 
     def add(self, url, sparse=None, depth=None, merge=True):
         if not self.is_allowed(url):
-            print(f"Blocked: {url} is not allowed (blacklisted or not whitelisted)")
+            print(f"Blocked: {url} is blacklisted")
             return
 
         name = self._repo_name_from_url(url)
@@ -435,6 +429,9 @@ def main():
     remove_parser = sub.add_parser("remove", help="Remove a submodule")
     remove_parser.add_argument("name", help="Repository name to remove")
 
+    rm_parser = sub.add_parser("rm", help="Alias for remove")
+    rm_parser.add_argument("name", help="Repository name to remove")
+
     desparse_parser = sub.add_parser("desparse", help="Disable sparse-checkout for specific repos")
     desparse_parser.add_argument("names", nargs="+", help="Repository name(s) to desparse")
 
@@ -456,6 +453,8 @@ def main():
     elif args.command == "add":
         gdm.add(args.url, sparse=args.sparse, depth=args.depth, merge=not args.no_merge)
     elif args.command == "remove":
+        gdm.remove(args.name)
+    elif args.command == "rm":
         gdm.remove(args.name)
     elif args.command == "desparse":
         gdm.desparse(args.names)
