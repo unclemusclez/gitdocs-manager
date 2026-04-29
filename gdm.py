@@ -42,12 +42,17 @@ class GitDocsManager:
                 "sparse_patterns": [
                     "/*",
                     "!/*",
-                    "/docs",
-                    "/Docs",
-                    "/examples",
-                    "/templates",
-                    "/*.md",
+                    "docs",
+                    "*Docs",
+                    "*examples",
+                    "*templates",
+                    "*/docs",
+                    "*/Docs",
+                    "*/examples",
+                    "*/templates",
+                    "/*.md*",
                     "/*.txt",
+                    "/*.rst",
                 ],
             }
             self._write_json(self.config_path, default_config)
@@ -134,7 +139,7 @@ class GitDocsManager:
             }
         return submodules
 
-    def add(self, url, sparse=None, depth=None):
+    def add(self, url, sparse=None, depth=None, merge=True):
         if not self.is_allowed(url):
             print(f"Blocked: {url} is not allowed (blacklisted or not whitelisted)")
             return
@@ -158,7 +163,7 @@ class GitDocsManager:
             return
 
         repo_path = self.root / name
-        self._apply_sparse_checkout(repo_path, sparse)
+        self._apply_sparse_checkout(repo_path, sparse, merge=merge)
         self._run_git(["checkout", "HEAD"], cwd=repo_path)
 
         if url not in self.target_repos:
@@ -193,20 +198,50 @@ class GitDocsManager:
 
         print(f"Removed: {name}")
 
-    def _apply_sparse_checkout(self, repo_path, patterns=None):
-        effective_patterns = patterns or self.sparse_patterns
-        if not effective_patterns:
-            return
-
-        self._run_git(["sparse-checkout", "init", "--cone"], cwd=repo_path)
-        self._run_git(["sparse-checkout", "set"] + effective_patterns, cwd=repo_path)
-
+    def _resolve_sparse_checkout_file(self, repo_path):
         sparse_file = repo_path / ".git" / "info" / "sparse-checkout"
         git_ref = repo_path / ".git"
         if git_ref.is_file():
             git_dir = Path(git_ref.read_text().strip().split(":")[-1].strip())
-            sparse_file = git_dir / "info" / "sparse-checkout"
+            candidate = git_dir / "info" / "sparse-checkout"
+            if candidate.exists():
+                sparse_file = candidate
+        return sparse_file
 
+    def _read_existing_sparse_patterns(self, repo_path):
+        sparse_file = self._resolve_sparse_checkout_file(repo_path)
+        if not sparse_file.exists():
+            return []
+        lines = sparse_file.read_text().splitlines()
+        return [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+
+    def _merge_sparse_patterns(self, existing, incoming):
+        merged = list(existing)
+        for p in incoming:
+            if p not in merged:
+                merged.append(p)
+        return merged
+
+    def _apply_sparse_checkout(self, repo_path, patterns=None, merge=True):
+        incoming = patterns or self.sparse_patterns
+        if not incoming:
+            return
+
+        existing = self._read_existing_sparse_patterns(repo_path) if merge else []
+        effective_patterns = self._merge_sparse_patterns(existing, incoming) if merge else incoming
+
+        if existing and merge:
+            added = [p for p in incoming if p not in existing]
+            if added:
+                print(f"  Merging {len(added)} new pattern(s) into existing sparse-checkout")
+            else:
+                print(f"  Sparse-checkout already up to date")
+                return
+
+        self._run_git(["sparse-checkout", "init", "--cone"], cwd=repo_path)
+        self._run_git(["sparse-checkout", "set"] + effective_patterns, cwd=repo_path)
+
+        sparse_file = self._resolve_sparse_checkout_file(repo_path)
         if not sparse_file.parent.exists():
             sparse_file.parent.mkdir(parents=True, exist_ok=True)
         sparse_file.write_text("\n".join(effective_patterns) + "\n")
@@ -225,7 +260,7 @@ class GitDocsManager:
                 registered += 1
         return registered
 
-    def sync(self):
+    def sync(self, merge_sparse=True):
         submodules = self._detect_submodules()
         print(f"Detected {len(submodules)} submodules")
 
@@ -252,7 +287,7 @@ class GitDocsManager:
                 else:
                     print(f"Updating: {rel_path}")
                     self._run_git(["submodule", "update", "--remote", rel_path])
-                self._apply_sparse_checkout(repo_path)
+                self._apply_sparse_checkout(repo_path, merge=merge_sparse)
                 self._run_git(["checkout", "HEAD"], cwd=repo_path)
             else:
                 print(f"Adding: {name}")
@@ -260,7 +295,7 @@ class GitDocsManager:
                     ["submodule", "add", "--depth", str(self.shallow_depth), url, name]
                 )
                 repo_path = self.root / name
-                self._apply_sparse_checkout(repo_path)
+                self._apply_sparse_checkout(repo_path, merge=False)
                 self._run_git(["checkout", "HEAD"], cwd=repo_path)
 
         self.generate_index()
@@ -345,11 +380,13 @@ def main():
 
     sync_parser = sub.add_parser("sync", help="Clone/update all configured repos")
     sync_parser.add_argument("--depth", type=int, default=None, help="Override shallow depth")
+    sync_parser.add_argument("--no-merge", action="store_true", help="Overwrite existing sparse-checkout rules instead of merging")
 
     add_parser = sub.add_parser("add", help="Add a new submodule")
     add_parser.add_argument("url", help="Repository URL to add")
     add_parser.add_argument("--sparse", nargs="*", default=None, help="Sparse checkout patterns (overrides config)")
     add_parser.add_argument("--depth", type=int, default=None, help="Override shallow depth for this repo")
+    add_parser.add_argument("--no-merge", action="store_true", help="Overwrite existing sparse-checkout rules instead of merging")
 
     remove_parser = sub.add_parser("remove", help="Remove a submodule")
     remove_parser.add_argument("name", help="Repository name to remove")
@@ -368,9 +405,9 @@ def main():
     elif args.command == "sync":
         if args.depth:
             gdm.shallow_depth = args.depth
-        gdm.sync()
+        gdm.sync(merge_sparse=not args.no_merge)
     elif args.command == "add":
-        gdm.add(args.url, sparse=args.sparse, depth=args.depth)
+        gdm.add(args.url, sparse=args.sparse, depth=args.depth, merge=not args.no_merge)
     elif args.command == "remove":
         gdm.remove(args.name)
     elif args.command == "status":
