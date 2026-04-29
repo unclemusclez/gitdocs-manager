@@ -50,8 +50,9 @@ class GitDocsManager:
                     "/Docs",
                     "/examples",
                     "/templates",
-                    "/*.md",
+                    "/*.md*",
                     "/*.txt",
+                    "/*.rst",
                 ],
             }
             self._write_json(self.config_path, default_config)

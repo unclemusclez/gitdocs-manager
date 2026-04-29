@@ -31,6 +31,14 @@ your-repo/
         └── flask/
 ```
 
+## Quick Install
+
+```bash
+wget https://raw.githubusercontent.com/unclemusclez/gitdocs-manager/main/gdm.py -O gdm.py
+# or
+curl -L https://raw.githubusercontent.com/unclemusclez/gitdocs-manager/main/gdm.py -o gdm.py
+```
+
 ## Usage
 
 ### Initialize
