@@ -46,6 +46,8 @@ class GitDocsManager:
                     "*/*Docs*/",
                     "*/*examples*/",
                     "*/*templates*/",
+                    "*/*demo*/"
+                    "*/*guides*/"
                     "/*.md*",
                     "/*.txt",
                     "/*.rst",
